@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 
 LOCAL_MODEL = False
+LOCAL_BERT = False
 EPOCHS = 10
 PARTIAL_SAMPLE = 10000
 
@@ -75,8 +76,10 @@ class BertClassifier(nn.Module):
     def __init__(self, freeze_bert=False):
         super(BertClassifier, self).__init__()
         D_in, H, D_out = 768, 50, 3
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        # self.bert = BertModel.from_pretrained('models/', local_files_only=True)
+        if not LOCAL_BERT:
+            self.bert = BertModel.from_pretrained('bert-base-uncased')
+        else:
+            self.bert = BertModel.from_pretrained('models/', local_files_only=True)
         self.classifier = nn.Sequential(
             nn.Linear(D_in, H),
             nn.ReLU(),
@@ -115,7 +118,10 @@ loss_fn = nn.CrossEntropyLoss()
 TEXT_WEIGHT = 0.9
 SUMMARY_WEIGHT = 1 - TEXT_WEIGHT
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+if not LOCAL_BERT:
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+else:
+    tokenizer = BertTokenizer.from_pretrained('models/', local_files_only=True)
 
 # FIXME: ignore summary, temporarily
 review_texts = df['review_text']
