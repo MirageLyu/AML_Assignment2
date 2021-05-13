@@ -10,6 +10,12 @@ import torch.nn as nn
 from time import time
 from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_with_warmup
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+import torch.nn.functional as F
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+
+LOCAL_MODEL = False
+EPOCHS = 10
+PARTIAL_SAMPLE = 10000
 
 
 if torch.cuda.is_available():
@@ -70,6 +76,7 @@ class BertClassifier(nn.Module):
         super(BertClassifier, self).__init__()
         D_in, H, D_out = 768, 50, 3
         self.bert = BertModel.from_pretrained('bert-base-uncased')
+        # self.bert = BertModel.from_pretrained('models/', local_files_only=True)
         self.classifier = nn.Sequential(
             nn.Linear(D_in, H),
             nn.ReLU(),
@@ -97,7 +104,7 @@ class BertClassifier(nn.Module):
 # token_ids = list(preprocess_for_bert([df['review_text'][0]])[0].squeeze().numpy())
 # print("Original: ", df['review_text'][0])
 # print("Token IDs: ", token_ids)
-df = load_train_data("data/train.csv")[:10000]
+df = load_train_data("data/train.csv")[:PARTIAL_SAMPLE]
 
 total_sample_num = len(df)
 print("Total training sample number: " + str(total_sample_num))
@@ -124,27 +131,26 @@ X_train, X_test, y_train, y_test = train_test_split(review_texts, fit_label, tes
 X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state=2021)
 train_inputs, train_masks = preprocess_for_bert(X_train)
 val_inputs, val_masks = preprocess_for_bert(X_val)
+test_inputs, test_masks = preprocess_for_bert(X_test)
 
-y_train_embed = []
-for lab in y_train:
-    if lab == 'fit':
-        y_train_embed.append(1)
-    elif lab == 'small':
-        y_train_embed.append(0)
-    elif lab == 'large':
-        y_train_embed.append(2)
+def label_embedding(y):
+    y_embed = []
+    for lab in y:
+        if lab == 'fit':
+            y_embed.append(1)
+        elif lab == 'small':
+            y_embed.append(0)
+        elif lab == 'large':
+            y_embed.append(2)
+    return y_embed
 
-y_val_embed = []
-for lab in y_val:
-    if lab == 'fit':
-        y_val_embed.append(1)
-    elif lab == 'small':
-        y_val_embed.append(0)
-    elif lab == 'large':
-        y_val_embed.append(2)
+y_train_embed = label_embedding(y_train)
+y_val_embed = label_embedding(y_val)
+y_test_embed = label_embedding(y_test)
 
 train_labels = torch.tensor(y_train_embed)
 val_labels = torch.tensor(y_val_embed)
+test_labels = torch.tensor(y_test_embed)
 
 batch_size = 32
 
@@ -156,8 +162,15 @@ val_data = TensorDataset(val_inputs, val_masks, val_labels)
 val_sampler = SequentialSampler(val_data)
 val_dataloader = DataLoader(val_data, sampler=val_sampler, batch_size=batch_size)
 
-def initialize_model(epochs=4):
-    bert_classifier = BertClassifier(freeze_bert=False)
+test_data = TensorDataset(test_inputs, test_masks, test_labels)
+test_sampler = SequentialSampler(test_data)
+test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=batch_size)
+
+def initialize_model(epochs=4, local_model=False):
+    if local_model:
+        bert_classifier = torch.load("bert-classifier.pkl")
+    else:
+        bert_classifier = BertClassifier(freeze_bert=False)
     bert_classifier.to(device)
     optimizer = AdamW(bert_classifier.parameters(), lr=5e-5, eps=1e-8)
     total_steps = len(train_dataloader) * epochs
@@ -172,6 +185,7 @@ def set_seed(seed_value=42):
 
 def train(model, train_dataloader, val_dataloader=None, epochs=4, evaluation=False):
     for epoch_i in range(epochs):
+        print("Epoch " + str(epoch_i) + " is running...")
         t0_epoch, t0_batch = time(), time()
         total_loss, batch_loss, batch_counts = 0, 0, 0
         model.train()
@@ -182,10 +196,6 @@ def train(model, train_dataloader, val_dataloader=None, epochs=4, evaluation=Fal
             model.zero_grad()
             logits = model(b_input_ids, b_attn_mask)
 
-            print(logits.shape)
-            print(b_labels.shape)
-            print(logits)
-            print(b_labels)
             loss = loss_fn(logits, b_labels)
             batch_loss += loss.item()
             total_loss += loss.item()
@@ -223,7 +233,7 @@ def evaluate(model, val_dataloader):
         with torch.no_grad():
             logits = model(b_inputs_ids, b_attn_mask)
         loss = loss_fn(logits, b_labels)
-        val_loss.append(loss_item())
+        val_loss.append(loss.item())
         preds = torch.argmax(logits, dim=1).flatten()
         accuracy = (preds == b_labels).cpu().numpy().mean() * 100
         val_accuracy.append(accuracy)
@@ -231,10 +241,39 @@ def evaluate(model, val_dataloader):
     val_accuracy = np.mean(val_accuracy)
     return val_loss, val_accuracy
 
-set_seed(42)
-bert_classifier, optimizer, scheduler = initialize_model(epochs=4)
-train(bert_classifier, train_dataloader, val_dataloader, epochs=4, evaluation=True)
+def bert_predict(model, test_dataloader):
+    model.eval()
+    all_logits = []
+    for batch in test_dataloader:
+        b_input_ids, b_attn_mask = tuple(t.to(device) for t in batch)[:2]
+        with torch.no_grad():
+            logits = model(b_input_ids, b_attn_mask)
+        all_logits.append(logits)
+    all_logits = torch.cat(all_logits, dim=0)
+    probs = F.softmax(all_logits, dim=1).cpu()
+    return probs
 
+set_seed(42)
+if not LOCAL_MODEL:
+    bert_classifier, optimizer, scheduler = initialize_model(epochs=EPOCHS, local_model=LOCAL_MODEL)
+    train(bert_classifier, train_dataloader, val_dataloader, epochs=EPOCHS, evaluation=True)
+    torch.save(bert_classifier, "bert-classifier.pkl")
+else:
+    bert_classifier, optimizer, scheduler = initialize_model(epochs=EPOCHS, local_model=LOCAL_MODEL)
+
+probs = bert_predict(bert_classifier, test_dataloader)
+y_pred = torch.argmax(probs, dim=1).numpy()
+y_true = np.array(y_test_embed)
+
+accuracy = accuracy_score(y_true, y_pred)
+precision = precision_score(y_true, y_pred)
+recall = recall_score(y_true, y_pred)
+f1 = f1_score(y_true, y_pred, average='macro')
+
+print("Accuracy: ", accuracy)
+print("Precision: ", precision)
+print("Recall: ", recall)
+print("macro-F1: ", f1)
 
 
 # all_sentences = np.append(df['review_summary'], df['review_text'])
