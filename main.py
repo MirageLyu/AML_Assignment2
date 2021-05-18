@@ -12,12 +12,12 @@ from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_wi
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+from tqdm import tqdm
 
 LOCAL_MODEL = False
 LOCAL_BERT = False
-EPOCHS = 10
-PARTIAL_SAMPLE = 10000
-
+EPOCHS = 1
+PARTIAL_SAMPLE = 10
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -31,10 +31,20 @@ else:
 original_columns = ['age', 'body type', 'bust size', 'category', 'fit', 'height', 'item_id', 'rating'
                     'rented for', 'review_date', 'review_summary', 'review_text', 'size', 'user_id', 'weight']
 
-
 def load_train_data(filepath):
     return pd.read_csv(filepath)
+df = load_train_data("data/train.csv")[:PARTIAL_SAMPLE]
+total_sample_num = len(df)
+print("Total training sample number: " + str(total_sample_num))
+MAX_LEN = 512
+loss_fn = nn.CrossEntropyLoss()
+TEXT_WEIGHT = 0.9
+SUMMARY_WEIGHT = 1 - TEXT_WEIGHT
 
+if not LOCAL_BERT:
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
+else:
+    tokenizer = BertTokenizer.from_pretrained('models/', local_files_only=True)
 
 def text_preprocessing(text):
     if type(text) is not str:
@@ -70,7 +80,6 @@ def preprocess_for_bert(text_arr):
     attention_masks = torch.tensor(attention_masks)
     return input_ids, attention_masks
 
-
 class BertClassifier(nn.Module):
     # freeze_bert: bool, set "False" to fine-tune the BERT model
     def __init__(self, freeze_bert=False):
@@ -93,51 +102,39 @@ class BertClassifier(nn.Module):
     def forward(self, inputs_ids, attention_mask):
         outputs = self.bert(inputs_ids, attention_mask)
         last_hidden_state_cls = outputs[0][:, 0, :]
+        print(last_hidden_state_cls.shape)
         logits = self.classifier(last_hidden_state_cls)
         return logits
 
-# specify the maximum length of our sentences
-# all_sentences = np.append(df['review_summary'].tolist(), df['review_text'].tolist())
-# encoded_sentences = [tokenizer.encode(sentence, add_special_tokens=True) for sentence in all_sentences]
-# max_len = max([len(sentence) for sentence in encoded_sentences])
-# print("Max Length: ", max_len)
-# MAX_LEN的值是从这边试出来的
-
-# One example
-# token_ids = list(preprocess_for_bert([df['review_text'][0]])[0].squeeze().numpy())
-# print("Original: ", df['review_text'][0])
-# print("Token IDs: ", token_ids)
-df = load_train_data("data/train.csv")[:PARTIAL_SAMPLE]
-
-total_sample_num = len(df)
-print("Total training sample number: " + str(total_sample_num))
-
-MAX_LEN = 512
-loss_fn = nn.CrossEntropyLoss()
-
-TEXT_WEIGHT = 0.9
-SUMMARY_WEIGHT = 1 - TEXT_WEIGHT
-
-if not LOCAL_BERT:
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True)
-else:
-    tokenizer = BertTokenizer.from_pretrained('models/', local_files_only=True)
-
-# FIXME: ignore summary, temporarily
-review_texts = df['review_text']
+# Take 'review_text' and 'review_summary' for bert_classifier
+review_data = df[['review_text', 'review_summary']]
 fit_label = df['fit']
-
 fit_label_embed = [1 if label == 'fit' else 0 for label in fit_label]
 positive_num = sum(fit_label_embed)
 negative_num = len(fit_label_embed)-positive_num
 print("Positive fit label number: " + str(positive_num))
 print("Negative fit label number: " + str(negative_num))
 
-X_train, X_test, y_train, y_test = train_test_split(review_texts, fit_label, test_size=0.2, random_state=2021)
+X_train, X_test, y_train, y_test = train_test_split(review_data, fit_label, test_size=0.2, random_state=2021)
 X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state=2021)
-train_inputs, train_masks = preprocess_for_bert(X_train)
-val_inputs, val_masks = preprocess_for_bert(X_val)
-test_inputs, test_masks = preprocess_for_bert(X_test)
+
+print("Processing train data...")
+train_inputs, train_masks = preprocess_for_bert(X_train['review_text'])
+train_sum_inputs, _ = preprocess_for_bert(X_train['review_summary'])
+train_inputs = torch.trunc(train_inputs * TEXT_WEIGHT + train_sum_inputs * SUMMARY_WEIGHT).int()
+print("Train data preprocessed.")
+
+print("Processing validate data...")
+val_inputs, val_masks = preprocess_for_bert(X_val['review_text'])
+val_sum_inputs, _ = preprocess_for_bert(X_val['review_summary'])
+val_inputs = torch.trunc(val_inputs * TEXT_WEIGHT + val_sum_inputs * SUMMARY_WEIGHT).int()
+print("Validate data preprocessed.")
+
+print("Processing test data...")
+test_inputs, test_masks = preprocess_for_bert(X_test['review_text'])
+test_sum_inputs, _ = preprocess_for_bert(X_test['review_summary'])
+test_inputs = torch.trunc(test_inputs * TEXT_WEIGHT + test_sum_inputs * SUMMARY_WEIGHT).int()
+print("Test data preprocessed.")
 
 def label_embedding(y):
     y_embed = []
@@ -207,19 +204,17 @@ def train(model, train_dataloader, val_dataloader=None, epochs=4, evaluation=Fal
             total_loss += loss.item()
 
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
             optimizer.step()
             scheduler.step()
 
             if (step % 20 == 0 and step != 0) or (step == len(train_dataloader)-1):
                 time_elapsed = time() - t0_batch
-
                 print("Batch Loss: ", batch_loss)
                 print("Total Loss: ", total_loss)
                 batch_loss, batch_counts = 0, 0
                 t0_batch = time()
+
         avg_train_loss = total_loss / len(train_dataloader)
         if evaluation == True:
             print("Evaluation: ")
@@ -272,31 +267,11 @@ y_pred = torch.argmax(probs, dim=1).numpy()
 y_true = np.array(y_test_embed)
 
 accuracy = accuracy_score(y_true, y_pred)
-precision = precision_score(y_true, y_pred)
-recall = recall_score(y_true, y_pred)
+precision = precision_score(y_true, y_pred, average='macro')
+recall = recall_score(y_true, y_pred, average='macro')
 f1 = f1_score(y_true, y_pred, average='macro')
 
 print("Accuracy: ", accuracy)
 print("Precision: ", precision)
 print("Recall: ", recall)
 print("macro-F1: ", f1)
-
-
-# all_sentences = np.append(df['review_summary'], df['review_text'])
-# sentence_inputs, sentence_masks = preprocess_for_bert(all_sentences)
-#
-# summary_inputs = sentence_inputs[:len(df['review_summary'])]
-# text_inputs = sentence_inputs[len(df['review_summary']):]
-# sample_inputs = []
-# for i in range(len(summary_inputs)):
-#     sample_inputs.append(summary_inputs[i]*SUMMARY_WEIGHT + text_inputs*TEXT_WEIGHT)
-#
-# summary_mask = sentence_masks[:len(df['review_summary'])]
-# text_mask = sentence_masks[len(df['review_summary']):]
-# sample_masks = []
-# for i in range(len(summary_mask)):
-#     sample_masks.append(summary_mask[i]*SUMMARY_WEIGHT + text_inputs*TEXT_WEIGHT)
-#
-# sample_inputs
-
-
